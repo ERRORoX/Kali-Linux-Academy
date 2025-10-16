@@ -1,0 +1,15 @@
+id показать активный ID пользователя с логином и группой
+
+last показать последний вход в систему
+
+who показать, кто вошел в систему
+
+groupadd ADMIN добавить группу ADMIN
+
+useradd -c akshayg admin-m akshay #Создать пользователя akshay
+
+userdel akshay Удалить пользователя akshay
+
+adduser akshay добавить пользователя akshay
+
+usermod изменить информацию пользователя
