@@ -1,0 +1,9 @@
+# Telegram Bot Dependencies
+aiogram==3.4.1
+python-dotenv==1.0.0
+
+# Standard library dependencies (включены в Python)
+# asyncio - встроен в Python 3.7+
+# pathlib - встроен в Python 3.4+
+# logging - встроен в Python
+# typing - встроен в Python 3.5+
