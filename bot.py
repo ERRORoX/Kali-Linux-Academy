@@ -2,7 +2,6 @@ import asyncio
 import logging
 import os
 from pathlib import Path
-import re
 from typing import Dict, List, Tuple
 from dotenv import load_dotenv
 
@@ -12,9 +11,37 @@ from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart, Command
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from aiogram.fsm.storage.memory import MemoryStorage
+# ===== КОНФИГУРАЦИЯ =====
 APP_ROOT = Path(__file__).resolve().parent
 INFO_DIR_NAME = "Информация"
 INFO_ROOT = APP_ROOT / INFO_DIR_NAME
+
+# ===== ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ =====
+subscribers: set[int] = set()  # Подписчики на уведомления
+known_files: set[str] = set()  # Известные файлы для отслеживания
+user_progress: Dict[int, Dict[str, bool]] = {}  # Прогресс изучения пользователей
+user_content_messages: Dict[int, List[int]] = {}  # ID сообщений с контентом для очистки
+
+# ===== УПРОЩЕННЫЕ ЭМОДЗИ =====
+def get_emoji(name: str) -> str:
+    """Получить эмодзи для раздела или контента"""
+    name_lower = name.lower()
+    if any(word in name_lower for word in ["базовый", "введение", "что такое"]):
+        return "🟢"
+    elif any(word in name_lower for word in ["средний", "атака", "человек"]):
+        return "🟡"
+    elif any(word in name_lower for word in ["продвинутый", "фишинг", "взлом"]):
+        return "🔴"
+    elif any(word in name_lower for word in ["команды", "система", "оборудование", "пользователь"]):
+        return "🔵"
+    elif any(word in name_lower for word in ["введение", "что такое"]):
+        return "👋"
+    elif any(word in name_lower for word in ["команды", "система"]):
+        return "⚡"
+    elif any(word in name_lower for word in ["атака", "фишинг"]):
+        return "🎯"
+    else:
+        return "📁" if "dir" in name_lower else "📘"
 
 
 class PathRegistry:
@@ -39,33 +66,12 @@ class PathRegistry:
         return self._id_to_path[assigned_id]
 
 
-path_registry = PathRegistry()
-# Подписчики для уведомлений о новых материалах
-subscribers: set[int] = set()
-# Известные файлы (.txt) для отслеживания изменений
-known_files: set[str] = set()
-# Сообщения с контентом, которые нужно чистить при переходах
-user_content_messages: Dict[int, List[int]] = {}
-# Статистика изучения пользователей
-user_progress: Dict[int, Dict[str, bool]] = {}
 
-# Цветовая схема для разделов
-SECTION_COLORS = {
-    "Базовый": "🟢", "Введение": "🟢", "Что такое": "🟢",
-    "Средний": "🟡", "Атака": "🟡", "Человек": "🟡",
-    "Продвинутый": "🔴", "Фишинг": "🔴", "Взлом": "🔴",
-    "Топ-команды": "🔵", "Система": "🔵", "Оборудование": "🔵", "Пользователь": "🔵"
-}
 
-# Эмодзи для типов контента
-CONTENT_EMOJIS = {
-    "введение": "👋", "что такое": "❓", "команды": "⚡", "система": "💻",
-    "оборудование": "🔧", "пользователь": "👤", "атака": "🎯", "фишинг": "🎣",
-    "взлом": "🔓", "безопасность": "🛡️", "сеть": "🌐", "анализ": "🔍"
-}
-
+# ===== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ =====
 
 def ensure_info_root() -> None:
+    """Проверяет существование папки с информацией"""
     if not INFO_ROOT.exists() or not INFO_ROOT.is_dir():
         raise FileNotFoundError(
             f"Папка '{INFO_DIR_NAME}' не найдена рядом с файлом: {APP_ROOT}"
@@ -73,10 +79,7 @@ def ensure_info_root() -> None:
 
 
 def list_dir(rel_dir: str) -> Tuple[List[Tuple[str, str]], List[Tuple[str, str]]]:
-    """
-    Возвращает (dirs, files) списки пар (отображаемое_имя, относительный_путь)
-    Только .txt файлы включаются в files.
-    """
+    """Получает список папок и .txt файлов в указанной директории"""
     base = (INFO_ROOT / rel_dir).resolve()
     if INFO_ROOT not in base.parents and base != INFO_ROOT:
         raise PermissionError("Выход за пределы корневой папки Информация запрещён")
@@ -93,6 +96,7 @@ def list_dir(rel_dir: str) -> Tuple[List[Tuple[str, str]], List[Tuple[str, str]]
 
 
 def read_text_file(rel_path: str) -> str:
+    """Читает содержимое .txt файла"""
     file_path = (INFO_ROOT / rel_path).resolve()
     if INFO_ROOT not in file_path.parents and file_path != INFO_ROOT:
         raise PermissionError("Выход за пределы корневой папки Информация запрещён")
@@ -100,93 +104,14 @@ def read_text_file(rel_path: str) -> str:
         return f.read()
 
 
-def escape_html(text: str) -> str:
-    return (
-        text
-        .replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-    )
 
 
-def render_txt_to_html(text: str) -> List[str]:
-    """Грубая разметка .txt: заголовки (#), списки (-/*), код (```), обычные абзацы.
-    Результат: список HTML-кусочков длиной до ~3000 символов для отправки.
-    """
-    lines = text.split("\n")
-    html_parts: List[str] = []
-    buffer: List[str] = []
-    in_code = False
-    code_buffer: List[str] = []
 
-    def flush_buffer():
-        if not buffer:
-            return
-        html_parts.append("\n".join(buffer))
-        buffer.clear()
 
-    for raw in lines:
-        line = raw.rstrip("\r")
-        if line.strip().startswith("```"):
-            if not in_code:
-                # начинаем блок кода
-                in_code = True
-                code_buffer = []
-            else:
-                # завершаем блок кода
-                in_code = False
-                flush_buffer()
-                code_text = '\n'.join(code_buffer)
-                # Ограничиваем длину блоков кода
-                if len(code_text) > 2000:
-                    code_text = code_text[:2000] + "\n... (код обрезан)"
-                html_parts.append(f"<pre>{escape_html(code_text)}</pre>")
-                code_buffer = []
-            continue
-
-        if in_code:
-            code_buffer.append(line)
-            continue
-
-        stripped = line.strip()
-        if stripped == "":
-            buffer.append("")
-            continue
-
-        m = re.match(r"^(#+)\s*(.+)$", stripped)
-        if m:
-            level = len(m.group(1))
-            title = escape_html(m.group(2))
-            prefix = "🟢" if level == 1 else ("🟡" if level == 2 else "🔴")
-            buffer.append(f"{prefix} <b>{title}</b>")
-            continue
-
-        if re.match(r"^[-*]\s+", stripped):
-            item = re.sub(r"^[-*]\s+", "", stripped)
-            buffer.append(f"• {escape_html(item)}")
-            continue
-
-        # Обычный абзац
-        buffer.append(escape_html(line))
-
-    flush_buffer()
-
-    # Склеиваем в куски по ~3000 символов (безопасный лимит)
-    chunks: List[str] = []
-    current = ""
-    for part in html_parts:
-        if len(current) + len(part) + 1 > 3000:
-            if current:
-                chunks.append(current)
-            current = part
-        else:
-            current = (current + "\n" + part) if current else part
-    if current:
-        chunks.append(current)
-    return chunks
 
 
 async def clear_user_messages(bot: Bot, chat_id: int) -> None:
+    """Удаляет предыдущие сообщения с контентом при переходе"""
     ids = user_content_messages.get(chat_id) or []
     if not ids:
         return
@@ -198,21 +123,6 @@ async def clear_user_messages(bot: Bot, chat_id: int) -> None:
     user_content_messages[chat_id] = []
 
 
-def get_section_emoji(name: str) -> str:
-    """Получить эмодзи для раздела на основе названия"""
-    name_lower = name.lower()
-    for key, emoji in SECTION_COLORS.items():
-        if key.lower() in name_lower:
-            return emoji
-    return "📁"
-
-def get_content_emoji(name: str) -> str:
-    """Получить эмодзи для контента на основе названия"""
-    name_lower = name.lower()
-    for key, emoji in CONTENT_EMOJIS.items():
-        if key in name_lower:
-            return emoji
-    return "📘"
 
 def build_dir_keyboard(rel_dir: str, user_id: int = 0) -> InlineKeyboardMarkup:
     dirs, files = list_dir(rel_dir)
@@ -221,7 +131,7 @@ def build_dir_keyboard(rel_dir: str, user_id: int = 0) -> InlineKeyboardMarkup:
     # Директории с цветовой индикацией
     for display_name, child_rel in dirs:
         iid = path_registry.get_id("dir", child_rel)
-        emoji = get_section_emoji(display_name)
+        emoji = get_emoji(display_name)
         # Проверяем прогресс изучения
         progress = ""
         if user_id and user_id in user_progress:
@@ -238,7 +148,7 @@ def build_dir_keyboard(rel_dir: str, user_id: int = 0) -> InlineKeyboardMarkup:
     # Файлы с индикацией изучения
     for display_name, child_rel in files:
         iid = path_registry.get_id("file", child_rel)
-        emoji = get_content_emoji(display_name)
+        emoji = get_emoji(display_name)
         # Индикатор изучения
         studied = "✅" if user_id and user_progress.get(user_id, {}).get(child_rel, False) else "📖"
         rows.append([InlineKeyboardButton(
@@ -289,8 +199,13 @@ def build_home_keyboard(user_id: int = 0) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
+# ===== ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ =====
+path_registry = PathRegistry()
+
+# ===== ОСНОВНОЙ РОУТЕР =====
 router = Router()
 
+# ===== ОБРАБОТЧИКИ КОМАНД =====
 
 @router.message(CommandStart())
 async def on_start(message: Message) -> None:
@@ -339,6 +254,7 @@ async def on_search_command(message: Message) -> None:
         ])
     )
 
+
 @router.message(Command("stats"))
 async def on_stats_command(message: Message) -> None:
     user_id = message.from_user.id
@@ -375,6 +291,8 @@ async def on_stats_command(message: Message) -> None:
     ]))
 
 
+# ===== ОБРАБОТЧИКИ CALLBACK =====
+
 @router.callback_query(F.data.startswith("open_dir:"))
 async def on_open_dir(callback: CallbackQuery) -> None:
     try:
@@ -390,17 +308,17 @@ async def on_open_dir(callback: CallbackQuery) -> None:
         # Красивый заголовок с эмодзи
         if rel_path:
             section_name = Path(rel_path).name
-            emoji = get_section_emoji(section_name)
-            title = f"{emoji} <b>{section_name}</b>\n<em>Раздел: {escape_html(rel_path)}</em>\n———"
+            emoji = get_emoji(section_name)
+            title = f"{emoji} {section_name}\nРаздел: {rel_path}\n———"
         else:
-            title = f"🎯 <b>Kali Linux Academy</b>\n<em>Главное меню</em>\n———"
+            title = f"🎯 Kali Linux Academy\nГлавное меню\n———"
         
         # Очищаем ранее отправленные контент-сообщения
         await clear_user_messages(callback.message.bot, callback.message.chat.id)
         
         # Проверяем, изменился ли контент перед редактированием
         try:
-            await callback.message.edit_text(title, reply_markup=kb, parse_mode=ParseMode.HTML)
+            await callback.message.edit_text(title, reply_markup=kb)
         except Exception as edit_error:
             if "message is not modified" in str(edit_error):
                 # Сообщение не изменилось, просто отвечаем
@@ -416,16 +334,6 @@ async def on_open_dir(callback: CallbackQuery) -> None:
         await callback.answer("Ошибка при открытии", show_alert=True)
 
 
-def split_message(text: str, limit: int = 4000) -> List[str]:
-    if len(text) <= limit:
-        return [text]
-    parts: List[str] = []
-    start = 0
-    while start < len(text):
-        end = min(len(text), start + limit)
-        parts.append(text[start:end])
-        start = end
-    return parts
 
 
 @router.callback_query(F.data.startswith("open_file:"))
@@ -449,48 +357,51 @@ async def on_open_file(callback: CallbackQuery) -> None:
         
         # Красивый заголовок с эмодзи
         file_name = Path(rel_path).name
-        emoji = get_content_emoji(file_name)
-        header = f"✅ <b>{emoji} {escape_html(file_name)}</b>\n<em>Раздел: {escape_html(str(Path(rel_path).parent.as_posix() or '/'))}</em>\n———"
+        emoji = get_emoji(file_name)
+        header = f"✅ {emoji} {file_name}\nРаздел: {str(Path(rel_path).parent.as_posix() or '/')}\n———"
+
+        # Сразу отвечаем на callback, чтобы избежать timeout
+        await callback.answer("✅ Материал отмечен как изученный!")
 
         # Очищаем предыдущие контент-сообщения
         await clear_user_messages(callback.message.bot, callback.message.chat.id)
 
         # Обновляем сообщение заголовком и клавиатурой (HTML)
-        await callback.message.edit_text(header, reply_markup=kb, parse_mode=ParseMode.HTML)
+        await callback.message.edit_text(header, reply_markup=kb)
 
-        # Красивый рендер .txt с ограничением длины
-        parts = render_txt_to_html(text)
+        # Отправляем содержимое .txt файла как простой текст
+        if len(text) > 4000:
+            # Разбиваем длинный текст на части
+            parts = [text[i:i+4000] for i in range(0, len(text), 4000)]
+        else:
+            parts = [text]
+        
         sent_ids: List[int] = []
-        for idx, part in enumerate(parts):
-            # Дополнительная проверка длины перед отправкой
-            if len(part) > 4000:
-                part = part[:4000] + "\n... (текст обрезан)"
+        for part in parts:
             try:
-                msg = await callback.message.answer(part, parse_mode=ParseMode.HTML)
+                msg = await callback.message.answer(part)
                 sent_ids.append(msg.message_id)
-            except Exception as send_error:
-                if "message is too long" in str(send_error):
-                    # Если всё ещё слишком длинно, разбиваем ещё больше
-                    sub_parts = [part[i:i+2000] for i in range(0, len(part), 2000)]
-                    for sub_part in sub_parts:
-                        try:
-                            msg = await callback.message.answer(sub_part, parse_mode=ParseMode.HTML)
-                            sent_ids.append(msg.message_id)
-                        except Exception:
-                            # Если и это не работает, пропускаем этот кусок
-                            continue
-                else:
-                    logging.warning(f"Ошибка отправки части {idx}: {send_error}")
-        user_content_messages.setdefault(callback.message.chat.id, []).extend(sent_ids)
-        await callback.answer("✅ Материал отмечен как изученный!")
+            except Exception as e:
+                logging.warning(f"Ошибка отправки текста: {e}")
+        
+        # Сохраняем ID отправленных сообщений для последующей очистки
+        if sent_ids:
+            user_content_messages[callback.message.chat.id] = sent_ids
     except KeyError:
-        await callback.answer("Ссылка устарела — откройте заново", show_alert=True)
+        try:
+            await callback.answer("Ссылка устарела — откройте заново", show_alert=True)
+        except:
+            pass  # Игнорируем ошибки callback
     except Exception as e:
         logging.exception("Ошибка при открытии файла: %s", e)
-        await callback.answer("Ошибка при открытии", show_alert=True)
+        try:
+            await callback.answer("Ошибка при открытии", show_alert=True)
+        except:
+            pass
 
 
-# Обработчики для новых кнопок
+# ===== ОБРАБОТЧИКИ СПЕЦИАЛЬНЫХ КНОПОК =====
+
 @router.callback_query(F.data == "search")
 async def on_search_callback(callback: CallbackQuery) -> None:
     await clear_user_messages(callback.message.bot, callback.message.chat.id)
@@ -573,34 +484,30 @@ async def on_random_callback(callback: CallbackQuery) -> None:
         
         # Красивый заголовок с эмодзи
         file_name = Path(rel_path).name
-        emoji = get_content_emoji(file_name)
-        header = f"🎯 <b>Случайный материал</b>\n\n✅ <b>{emoji} {escape_html(file_name)}</b>\n<em>Раздел: {escape_html(str(Path(rel_path).parent.as_posix() or '/'))}</em>\n———"
+        emoji = get_emoji(file_name)
+        header = f"🎯 Случайный материал\n\n✅ {emoji} {file_name}\nРаздел: {str(Path(rel_path).parent.as_posix() or '/')}\n———"
 
         await clear_user_messages(callback.message.bot, callback.message.chat.id)
-        await callback.message.edit_text(header, reply_markup=kb, parse_mode=ParseMode.HTML)
-        parts = render_txt_to_html(text)
+        await callback.message.edit_text(header, reply_markup=kb)
+        
+        # Отправляем содержимое .txt файла как простой текст
+        if len(text) > 4000:
+            # Разбиваем длинный текст на части
+            parts = [text[i:i+4000] for i in range(0, len(text), 4000)]
+        else:
+            parts = [text]
+        
         sent_ids: List[int] = []
-        for idx, part in enumerate(parts):
-            # Дополнительная проверка длины перед отправкой
-            if len(part) > 4000:
-                part = part[:4000] + "\n... (текст обрезан)"
+        for part in parts:
             try:
-                msg = await callback.message.answer(part, parse_mode=ParseMode.HTML)
+                msg = await callback.message.answer(part)
                 sent_ids.append(msg.message_id)
-            except Exception as send_error:
-                if "message is too long" in str(send_error):
-                    # Если всё ещё слишком длинно, разбиваем ещё больше
-                    sub_parts = [part[i:i+2000] for i in range(0, len(part), 2000)]
-                    for sub_part in sub_parts:
-                        try:
-                            msg = await callback.message.answer(sub_part, parse_mode=ParseMode.HTML)
-                            sent_ids.append(msg.message_id)
-                        except Exception:
-                            # Если и это не работает, пропускаем этот кусок
-                            continue
-                else:
-                    logging.warning(f"Ошибка отправки части {idx}: {send_error}")
-        user_content_messages.setdefault(callback.message.chat.id, []).extend(sent_ids)
+            except Exception as e:
+                logging.warning(f"Ошибка отправки текста: {e}")
+        
+        # Сохраняем ID отправленных сообщений для последующей очистки
+        if sent_ids:
+            user_content_messages[callback.message.chat.id] = sent_ids
         await callback.answer("🎯 Случайный материал выбран! ✅ Отмечен как изученный!")
     except Exception as e:
         logging.exception("Ошибка при открытии случайного файла: %s", e)
@@ -631,7 +538,8 @@ async def on_home_callback(callback: CallbackQuery) -> None:
     await callback.answer()
 
 
-# Поиск по тексту файлов
+# ===== ПОИСК ПО ТЕКСТУ =====
+
 @router.message()
 async def on_text_search(message: Message) -> None:
     if not message.text or message.text.startswith('/'):
@@ -666,29 +574,28 @@ async def on_text_search(message: Message) -> None:
     
     if not results:
         await message.answer(
-            f"🔍 По запросу '<code>{escape_html(search_term)}</code>' ничего не найдено.\n\n"
+            f"🔍 По запросу '{search_term}' ничего не найдено.\n\n"
             "Попробуйте другие ключевые слова или проверьте правописание.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="🏠 Главная", callback_data="home")]
             ]),
-            parse_mode=ParseMode.HTML
         )
         return
     
     # Отправляем результаты поиска
-    response = f"🔍 <b>Результаты поиска по запросу:</b> '<code>{escape_html(search_term)}</code>'\n\n"
+    response = f"🔍 Результаты поиска по запросу: '{search_term}'\n\n"
     
     for i, (file_path, contexts) in enumerate(results[:5]):  # Ограничиваем 5 результатами
         file_name = Path(file_path).name
-        emoji = get_content_emoji(file_name)
-        response += f"<b>{i+1}. {emoji} {escape_html(file_name)}</b>\n"
-        response += f"<em>Путь: {escape_html(file_path)}</em>\n"
+        emoji = get_emoji(file_name)
+        response += f"{i+1}. {emoji} {file_name}\n"
+        response += f"Путь: {file_path}\n"
         
         # Добавляем кнопку для открытия файла
         file_id = path_registry.get_id("file", file_path)
         
         for context in contexts[:2]:  # Показываем максимум 2 контекста
-            response += f"<pre>{escape_html(context)}</pre>\n"
+            response += f"{context}\n"
         
         response += "\n"
     
@@ -707,7 +614,10 @@ async def on_text_search(message: Message) -> None:
     await message.answer(response, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode=ParseMode.HTML)
 
 
+# ===== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ МОНИТОРИНГА =====
+
 def scan_all_txt() -> set[str]:
+    """Сканирует все .txt файлы в папке Информация"""
     files: set[str] = set()
     for path in INFO_ROOT.rglob("*.txt"):
         rel = path.relative_to(INFO_ROOT).as_posix()
@@ -716,8 +626,8 @@ def scan_all_txt() -> set[str]:
 
 
 async def watch_info_changes(bot: Bot, interval_seconds: int = 10) -> None:
+    """Фоновый мониторинг папки на предмет новых файлов"""
     global known_files
-    # Инициализация списка известных файлов
     known_files = scan_all_txt()
     while True:
         try:
@@ -730,12 +640,8 @@ async def watch_info_changes(bot: Bot, interval_seconds: int = 10) -> None:
                     dir_id = path_registry.get_id("dir", parent_dir)
                     kb = InlineKeyboardMarkup(
                         inline_keyboard=[
-                            [
-                                InlineKeyboardButton(text="📘 Открыть файл", callback_data=f"open_file:{file_id}"),
-                            ],
-                            [
-                                InlineKeyboardButton(text="📂 Открыть раздел", callback_data=f"open_dir:{dir_id}"),
-                            ],
+                            [InlineKeyboardButton(text="📘 Открыть файл", callback_data=f"open_file:{file_id}")],
+                            [InlineKeyboardButton(text="📂 Открыть раздел", callback_data=f"open_dir:{dir_id}")],
                         ]
                     )
                     for chat_id in list(subscribers):
@@ -749,49 +655,44 @@ async def watch_info_changes(bot: Bot, interval_seconds: int = 10) -> None:
         await asyncio.sleep(interval_seconds)
 
 
+# ===== ГЛАВНАЯ ФУНКЦИЯ ЗАПУСКА =====
+
 async def main() -> None:
+    """Основная функция запуска бота"""
     logging.basicConfig(level=logging.INFO)
     ensure_info_root()
 
-    # Загрузка переменных окружения из .env в корне проекта
+    # Загрузка токена из .env
     env_path = APP_ROOT / ".env"
     load_dotenv(dotenv_path=env_path, override=False)
-
     token = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN")
+    
     if not token:
-        raise RuntimeError(
-            "Не задан токен. Укажите TELEGRAM_BOT_TOKEN или BOT_TOKEN в .env или окружении"
-        )
-
-    # Простая валидация формата токена и защита от плейсхолдера
+        raise RuntimeError("Не задан токен. Укажите TELEGRAM_BOT_TOKEN или BOT_TOKEN в .env")
+    
+    # Валидация токена
     token = token.strip()
     if "PASTE_YOUR_TOKEN_HERE" in token or token == "":
-        raise RuntimeError(
-            "В .env оставлен плейсхолдер токена. Вставьте реальный токен от @BotFather"
-        )
-    if not re.match(r"^\d{5,}:[A-Za-z0-9_-]{10,}$", token):
-        logging.warning("Токен выглядит необычно. Проверьте, что скопирован полностью без пробелов")
+        raise RuntimeError("В .env оставлен плейсхолдер токена. Вставьте реальный токен от @BotFather")
 
-    # Предварительная проверка токена до запуска polling
+    # Создание бота и диспетчера
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
+    
     async with Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML)) as bot:
+        # Проверка токена
         try:
             await bot.get_me()
         except Exception as e:
-            text = str(e)
-            lower = text.lower()
             logging.error("Проверка токена не пройдена: %r", e)
-            if "unauthorized" in lower or "401" in lower:
-                raise RuntimeError("Токен отклонён (401 Unauthorized). Проверьте токен от @BotFather.")
-            if "not found" in lower or "404" in lower:
-                raise RuntimeError("Telegram API ответил 404 Not Found. Обычно это неверный или обрезанный токен.")
-            raise RuntimeError(f"Ошибка при проверке токена: {text}")
+            raise RuntimeError(f"Ошибка при проверке токена: {str(e)}")
 
-        # Запускаем наблюдатель за папкой в фоне
+        # Запуск фонового мониторинга и polling
         asyncio.create_task(watch_info_changes(bot))
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
+
+# ===== ТОЧКА ВХОДА =====
 
 if __name__ == "__main__":
     try:
