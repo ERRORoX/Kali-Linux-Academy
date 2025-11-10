@@ -193,7 +193,8 @@ def build_home_keyboard(user_id: int = 0) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="🚀 Приступить к изучению Kali Linux", callback_data=f"open_dir:{home_id}")],
         [InlineKeyboardButton(text="🔍 Поиск по материалам", callback_data="search")],
         [InlineKeyboardButton(text="📊 Моя статистика", callback_data="stats")],
-        [InlineKeyboardButton(text="🎯 Случайный материал", callback_data="random")]
+
+
     ]
     
     return InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -453,65 +454,7 @@ async def on_stats_callback(callback: CallbackQuery) -> None:
     ]), parse_mode=ParseMode.HTML)
     await callback.answer()
 
-@router.callback_query(F.data == "random")
-async def on_random_callback(callback: CallbackQuery) -> None:
-    all_files = list(scan_all_txt())
-    if not all_files:
-        await clear_user_messages(callback.message.bot, callback.message.chat.id)
-        await callback.message.edit_text("📚 Пока нет материалов для изучения.")
-        return
-    
-    import random
-    random_file = random.choice(all_files)
-    file_id = path_registry.get_id("file", random_file)
-    
-    # Открываем случайный файл
-    try:
-        kind, rel_path = path_registry.resolve(file_id)
-        if kind != "file":
-            await callback.answer("Ошибка выбора файла", show_alert=True)
-            return
-        
-        # Отмечаем файл как изученный
-        user_id = callback.from_user.id
-        if user_id not in user_progress:
-            user_progress[user_id] = {}
-        user_progress[user_id][rel_path] = True
-        
-        text = read_text_file(rel_path)
-        parent_dir = str(Path(rel_path).parent.as_posix()) if Path(rel_path).parent.as_posix() != "." else ""
-        kb = build_dir_keyboard(parent_dir, user_id)
-        
-        # Красивый заголовок с эмодзи
-        file_name = Path(rel_path).name
-        emoji = get_emoji(file_name)
-        header = f"🎯 Случайный материал\n\n✅ {emoji} {file_name}\nРаздел: {str(Path(rel_path).parent.as_posix() or '/')}\n———"
 
-        await clear_user_messages(callback.message.bot, callback.message.chat.id)
-        await callback.message.edit_text(header, reply_markup=kb)
-        
-        # Отправляем содержимое .txt файла как простой текст
-        if len(text) > 4000:
-            # Разбиваем длинный текст на части
-            parts = [text[i:i+4000] for i in range(0, len(text), 4000)]
-        else:
-            parts = [text]
-        
-        sent_ids: List[int] = []
-        for part in parts:
-            try:
-                msg = await callback.message.answer(part)
-                sent_ids.append(msg.message_id)
-            except Exception as e:
-                logging.warning(f"Ошибка отправки текста: {e}")
-        
-        # Сохраняем ID отправленных сообщений для последующей очистки
-        if sent_ids:
-            user_content_messages[callback.message.chat.id] = sent_ids
-        await callback.answer("🎯 Случайный материал выбран! ✅ Отмечен как изученный!")
-    except Exception as e:
-        logging.exception("Ошибка при открытии случайного файла: %s", e)
-        await callback.answer("Ошибка при открытии", show_alert=True)
 
 @router.callback_query(F.data == "home")
 async def on_home_callback(callback: CallbackQuery) -> None:
